@@ -39,6 +39,15 @@ export async function exchangeCodeForTokens(code: string) {
   }
 
   const data = await res.json();
+
+  // The authorization_code grant must return a refresh token. If it does not,
+  // fail loudly here instead of silently storing a record that cannot refresh.
+  if (!data.refresh_token) {
+    throw new Error(
+      "Clio did not return a refresh_token on authorization. Re-authorize and ensure offline access is granted."
+    );
+  }
+
   tokenStore = {
     access_token: data.access_token,
     refresh_token: data.refresh_token,
@@ -54,12 +63,15 @@ async function refreshAccessToken() {
     throw new Error("No refresh token available. Please re-authorize.");
   }
 
+  // Capture the existing refresh token BEFORE the request so we never lose it.
+  const existingRefreshToken = tokenStore.refresh_token;
+
   const res = await fetch(`${CLIO_API_BASE}/oauth/token`, {
     method: "POST",
     headers: { "Content-Type": "application/x-www-form-urlencoded" },
     body: new URLSearchParams({
       grant_type: "refresh_token",
-      refresh_token: tokenStore.refresh_token,
+      refresh_token: existingRefreshToken,
       client_id: CLIO_CLIENT_ID,
       client_secret: CLIO_CLIENT_SECRET,
     }).toString(),
@@ -71,9 +83,13 @@ async function refreshAccessToken() {
   }
 
   const data = await res.json();
+
   tokenStore = {
     access_token: data.access_token,
-    refresh_token: data.refresh_token,
+    // ROOT-CAUSE FIX: Clio does not always echo a refresh_token on refresh.
+    // Keep the existing one when the response omits it, so we never overwrite
+    // a good refresh token with undefined (which caused the prior outage).
+    refresh_token: data.refresh_token ?? existingRefreshToken,
     expires_at: Date.now() + data.expires_in * 1000,
   };
 
@@ -81,18 +97,29 @@ async function refreshAccessToken() {
   return tokenStore;
 }
 
-// Persist tokens to Upstash Redis via REST API
+// Persist tokens to Upstash Redis via REST API.
+// Uses a POST body for the value instead of putting JSON in the URL path,
+// which avoids URL-length and encoding edge cases.
 async function persistTokens() {
   const url = process.env.KV_REST_API_URL;
   const token = process.env.KV_REST_API_TOKEN;
-  if (!url || !token) return;
+  if (!url || !token) {
+    console.error("[clio] KV not configured (KV_REST_API_URL / KV_REST_API_TOKEN missing). Tokens are in-memory only and will be lost on cold start.");
+    return;
+  }
 
   try {
-    await fetch(`${url}/set/clio_tokens/${encodeURIComponent(JSON.stringify(tokenStore))}`, {
+    const res = await fetch(`${url}/set/clio_tokens`, {
+      method: "POST",
       headers: { Authorization: `Bearer ${token}` },
+      body: JSON.stringify(tokenStore),
     });
-  } catch {
-    // Redis not available, tokens stay in memory
+    if (!res.ok) {
+      const body = await res.text();
+      console.error(`[clio] Failed to persist tokens to KV: ${res.status} ${body}`);
+    }
+  } catch (e) {
+    console.error("[clio] Error persisting tokens to KV:", e);
   }
 }
 
@@ -107,12 +134,24 @@ async function loadTokens() {
     const res = await fetch(`${url}/get/clio_tokens`, {
       headers: { Authorization: `Bearer ${token}` },
     });
+    if (!res.ok) {
+      const body = await res.text();
+      console.error(`[clio] Failed to load tokens from KV: ${res.status} ${body}`);
+      return;
+    }
     const data = await res.json();
     if (data.result) {
-      tokenStore = typeof data.result === "string" ? JSON.parse(data.result) : data.result;
+      const parsed = typeof data.result === "string" ? JSON.parse(data.result) : data.result;
+      // Guard: ignore a stored record that has no refresh token. Better to force
+      // a clean re-auth than to load a record that can never refresh.
+      if (parsed && parsed.refresh_token) {
+        tokenStore = parsed;
+      } else {
+        console.error("[clio] Stored token record has no refresh_token; ignoring it. Re-authorization required.");
+      }
     }
-  } catch {
-    // Redis not available
+  } catch (e) {
+    console.error("[clio] Error loading tokens from KV:", e);
   }
 }
 
