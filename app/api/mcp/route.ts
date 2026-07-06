@@ -170,6 +170,16 @@ async function handleMessage(body: Record<string, unknown>): Promise<unknown | n
 }
 
 export async function POST(req: NextRequest) {
+  // Shared-secret gate: when MCP_API_KEY is set in the deployment environment,
+  // callers must present the same value in the x-api-key header. Unset = open
+  // (bootstrap / backward compatibility while callers are updated).
+  const requiredKey = process.env.MCP_API_KEY;
+  if (requiredKey && req.headers.get("x-api-key") !== requiredKey) {
+    return new Response(JSON.stringify({ error: "unauthorized" }), {
+      status: 401,
+      headers: { "Content-Type": "application/json" },
+    });
+  }
   const accept = req.headers.get("accept") || "";
   const preferSSE = accept.includes("text/event-stream");
 
